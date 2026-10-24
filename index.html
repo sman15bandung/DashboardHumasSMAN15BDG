@@ -301,6 +301,7 @@
                                     <button type="button" id="btnEkstrak" class="text-xs text-primary font-medium hover:underline"><i class="fa-solid fa-wand-magic-sparkles mr-1"></i>Ambil otomatis dari HTML</button>
                                 </div>
                                 <textarea id="fDash" rows="5" spellcheck="false" placeholder="Contoh pengisian (ketik sendiri atau klik Ambil otomatis):&#10;Senin = 98&#10;Selasa = 96&#10;Rabu = 97" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs font-mono focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary bg-white"></textarea>
+                                <p id="ekstrakInfo" class="text-xs"></p>
                                 <p class="text-xs text-slate-400">Grafik dashboard memakai laporan terbaru (berdasarkan tanggal) yang dipilih untuk grafik tersebut.</p>
                             </div>
                         </div>
@@ -745,7 +746,8 @@
 
             const slot = $('fSlot').value;
             if (slot) {
-                const dash = parseDash($('fDash').value) || (() => { const h = ekstrakDariHtml(payload.html_content); return h ? { labels: h.labels, values: h.values } : null; })();
+                let dash = parseDash($('fDash').value);
+                if (!dash) { pesanAdmin('Mencari data grafik di laporan...', true); const h = await ekstrakLengkap(payload.html_content); dash = h ? { labels: h.labels, values: h.values } : null; }
                 if (!dash) {
                     $('fDashWrap').classList.remove('hidden');
                     $('fDash').classList.add('border-red-400');
@@ -816,46 +818,100 @@
             return labels.length >= 2 ? { labels, values } : null;
         }
 
+        // --- penolong ekstraksi ---
+        function dariTabelRows(rows) {
+            const lab = [], val = [];
+            rows.forEach(sel => {
+                if (sel.length < 2 || !sel[0]) return;
+                for (let i = 1; i < sel.length; i++) {
+                    if (/^-?[0-9][0-9.,]*\s*%?$/.test(sel[i])) { lab.push(sel[0]); val.push(parseAngka(sel[i])); break; }
+                }
+            });
+            return lab.length >= 2 ? { labels: lab, values: val } : null;
+        }
+        function dariTeks(teks) {
+            const lab = [], val = [];
+            for (const m of teks.matchAll(/([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .\/&()'-]{1,40}?)\s*[:=\-–]?\s*(\d+(?:[.,]\d+)?)\s*%/g)) { lab.push(m[1].trim()); val.push(parseAngka(m[2])); }
+            return lab.length >= 2 ? { labels: lab, values: val } : null;
+        }
+
+        // 1) Cepat: baca dari teks kode HTML (Chart.js literal, tabel, daftar)
         function ekstrakDariHtml(html) {
-            // 1) Chart.js: labels: [...] dan data: [...]
             const cLabels = [...html.matchAll(/labels\s*:\s*\[([^\]]*)\]/g)];
             const cData = [...html.matchAll(/data\s*:\s*\[([^\]]*)\]/g)];
             for (const l of cLabels) {
                 const lab = [...l[1].matchAll(/(['"`])(.*?)\1/g)].map(m => m[2]);
                 for (const d of cData) {
                     const val = (d[1].match(/-?\d+(?:\.\d+)?/g) || []).map(Number);
-                    if (lab.length >= 2 && lab.length === val.length) return { labels: lab, values: val, dari: 'grafik di laporan' };
+                    if (lab.length >= 2 && lab.length === val.length) return { labels: lab, values: val, dari: 'grafik di kode laporan' };
                 }
             }
-            // 2) Tabel HTML (kolom pertama = label, kolom angka pertama = nilai)
             const doc = new DOMParser().parseFromString(html, 'text/html');
             for (const tb of doc.querySelectorAll('table')) {
-                const lab = [], val = [];
-                tb.querySelectorAll('tr').forEach(tr => {
-                    const sel = [...tr.children].map(c => c.textContent.trim());
-                    if (sel.length < 2 || !sel[0]) return;
-                    for (let i = 1; i < sel.length; i++) {
-                        if (/^-?[0-9][0-9.,]*\s*%?$/.test(sel[i])) { lab.push(sel[0]); val.push(parseAngka(sel[i])); break; }
-                    }
-                });
-                if (lab.length >= 2) return { labels: lab, values: val, dari: 'tabel di laporan' };
+                const r = dariTabelRows([...tb.querySelectorAll('tr')].map(tr => [...tr.children].map(c => c.textContent.trim())));
+                if (r) return { ...r, dari: 'tabel di laporan' };
             }
-            // 3) Daftar teks "Futsal: 35%"
-            const teks = doc.body ? doc.body.innerText || doc.body.textContent : html;
-            const lab = [], val = [];
-            for (const m of teks.matchAll(/([A-Za-zÀ-ÿ][^:\n<>]{1,40}):\s*(\d+(?:[.,]\d+)?)\s*%/g)) { lab.push(m[1].trim()); val.push(parseAngka(m[2])); }
-            if (lab.length >= 2) return { labels: lab, values: val, dari: 'daftar di laporan' };
-            return null;
+            const r = dariTeks(doc.body ? doc.body.textContent : html);
+            return r ? { ...r, dari: 'daftar di laporan' } : null;
+        }
+
+        // 2) Lengkap: jalankan laporan di kotak tersembunyi (sandbox) lalu baca grafik/tabel yang tampil
+        function ekstrakDariTampilan(html) {
+            return new Promise(resolve => {
+                const f = document.createElement('iframe');
+                f.setAttribute('sandbox', 'allow-scripts');
+                f.style.cssText = 'position:fixed;left:-9999px;top:0;width:1000px;height:700px;border:0;visibility:hidden';
+                let selesai = false;
+                const akhir = (hasil) => { if (selesai) return; selesai = true; window.removeEventListener('message', onMsg); clearTimeout(t); f.remove(); resolve(hasil); };
+                const onMsg = (e) => {
+                    if (e.source !== f.contentWindow || !e.data || !e.data.__ekstrak) return;
+                    for (const c of (e.data.charts || [])) {
+                        const lab = (c.labels || []).map(String), v = (c.values && c.values[0] || []).map(Number);
+                        if (lab.length >= 2 && lab.length === v.length && v.every(n => !isNaN(n))) return akhir({ labels: lab, values: v, dari: 'grafik yang tampil di laporan' });
+                    }
+                    for (const tb of (e.data.tables || [])) { const r = dariTabelRows(tb); if (r) return akhir({ ...r, dari: 'tabel yang tampil di laporan' }); }
+                    const r = dariTeks(e.data.text || '');
+                    akhir(r ? { ...r, dari: 'teks yang tampil di laporan' } : null);
+                };
+                window.addEventListener('message', onMsg);
+                const t = setTimeout(() => akhir(null), 8000);
+                const inj = '<script>addEventListener("load",function(){setTimeout(function(){var o={__ekstrak:true,charts:[],tables:[],text:""};try{'
+                    + 'if(window.Chart){var I=Chart.instances;(Array.isArray(I)?I:Object.keys(I).map(function(k){return I[k]})).forEach(function(c){try{o.charts.push({labels:c.data.labels,values:c.data.datasets.map(function(d){return d.data})})}catch(e){}})}'
+                    + 'document.querySelectorAll("table").forEach(function(tb){o.tables.push(Array.prototype.map.call(tb.querySelectorAll("tr"),function(tr){return Array.prototype.map.call(tr.children,function(c){return c.textContent.trim()})}))});'
+                    + 'o.text=document.body.innerText||""}catch(e){}parent.postMessage(o,"*")},1800)});<\/script>';
+                let doc = bungkusHtml(html);
+                doc = /<\/body>/i.test(doc) ? doc.replace(/<\/body>/i, inj + '</body>') : doc + inj;
+                f.srcdoc = doc;
+                document.body.appendChild(f);
+            });
+        }
+        async function ekstrakLengkap(html) {
+            return ekstrakDariHtml(html) || await ekstrakDariTampilan(html);
         }
 
         $('fSlot').addEventListener('change', () => {
             $('fDashWrap').classList.toggle('hidden', !$('fSlot').value);
             if ($('fSlot').value && !$('fDash').value.trim() && $('fHtml').value.trim()) $('btnEkstrak').click();
         });
-        $('btnEkstrak').addEventListener('click', () => {
-            const hasil = ekstrakDariHtml($('fHtml').value);
-            if (!hasil) return pesanAdmin('Data angka tidak ditemukan otomatis. Isi manual dengan format "Label = nilai".');
+        $('btnEkstrak').addEventListener('click', async () => {
+            const html = $('fHtml').value;
+            const info = $('ekstrakInfo');
+            const btn = $('btnEkstrak');
+            if (!html.trim()) { info.className = 'text-xs text-red-600'; info.textContent = 'Tempel HTML laporan terlebih dahulu.'; return pesanAdmin('Tempel HTML laporan terlebih dahulu.'); }
+            btn.disabled = true;
+            info.className = 'text-xs text-slate-500'; info.textContent = 'Mencari data di laporan...';
+            let hasil = null;
+            try { hasil = await ekstrakLengkap(html); } catch (e) { hasil = null; }
+            btn.disabled = false;
+            if (!hasil) {
+                info.className = 'text-xs text-red-600';
+                info.textContent = 'Angka tidak ditemukan otomatis. Isi manual di kolom di atas, satu baris satu data (contoh: Senin = 98).';
+                return pesanAdmin('Angka tidak ditemukan otomatis di laporan ini. Isi manual dengan format "Label = nilai".');
+            }
             $('fDash').value = hasil.labels.map((l, i) => l + ' = ' + hasil.values[i]).join('\n');
+            $('fDash').classList.remove('border-red-400');
+            info.className = 'text-xs text-green-700';
+            info.textContent = 'Berhasil: ' + hasil.labels.length + ' data dari ' + hasil.dari + '. Periksa lalu klik Simpan.';
             pesanAdmin('Data diambil dari ' + hasil.dari + ' (' + hasil.labels.length + ' baris). Periksa dulu sebelum menyimpan.', true);
         });
 
